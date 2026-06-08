@@ -199,24 +199,35 @@ with map_col:
                "Orange dots: Home Depot stores from OSM.")
 
     st.subheader("Top 10 counties by Demand Priority Index")
-    df = pd.DataFrame(regions[:10])[
-        ["fips", "name", "dpi", "population", "store_count",
-         "active_alert_count", "active_categories", "hazard_source"]
-    ].rename(columns={
-        "name": "County",
-        "dpi": "DPI",
-        "population": "Pop",
-        "store_count": "Stores",
-        "active_alert_count": "Alerts",
-        "active_categories": "Active categories",
-        "hazard_source": "Hazard source",
-    })
-    df["DPI"] = df["DPI"].map(lambda x: f"{x:.3f}")
-    df["Pop"] = df["Pop"].map(lambda x: f"{x:,}")
-    st.dataframe(df, hide_index=True, use_container_width=True)
+    if not regions:
+        st.info(
+            f"No counties match the active filter "
+            f"(disaster = `{disaster_filter}`). FL has no active NWS alerts "
+            "of that type right now. Set the filter back to `(none)` to see "
+            "baseline-driven ranking."
+        )
+    else:
+        df = pd.DataFrame(regions[:10])[
+            ["fips", "name", "dpi", "population", "store_count",
+             "active_alert_count", "active_categories", "hazard_source"]
+        ].rename(columns={
+            "name": "County",
+            "dpi": "DPI",
+            "population": "Pop",
+            "store_count": "Stores",
+            "active_alert_count": "Alerts",
+            "active_categories": "Active categories",
+            "hazard_source": "Hazard source",
+        })
+        df["DPI"] = df["DPI"].map(lambda x: f"{x:.3f}")
+        df["Pop"] = df["Pop"].map(lambda x: f"{x:,}")
+        st.dataframe(df, hide_index=True, use_container_width=True)
 
 with detail_col:
     st.subheader("County detail")
+    if not regions:
+        st.info("Pick a county from the unfiltered view, or clear the disaster filter.")
+        st.stop()
     fips_options = [r["fips"] for r in regions]
     label_for = {r["fips"]: f"{r['name']} (DPI {r['dpi']:.3f})" for r in regions}
     selected = st.selectbox(
