@@ -116,6 +116,27 @@ def fetch_scenario(scenario_id: str) -> dict:
     return r.json()
 
 
+def run_inventory_check(scenario_id: str) -> dict:
+    r = httpx.post(f'{BACKEND_URL}/scenarios/{scenario_id}/check-inventory', timeout=120)
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_transfer_orders(status: str | None = None, limit: int = 100) -> dict:
+    params = {'limit': limit}
+    if status: params['status'] = status
+    r = httpx.get(f'{BACKEND_URL}/transfer-orders', params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def update_transfer_order(to_id: str, action: str) -> dict:
+    '''action is 'approve' or 'reject'.'''
+    r = httpx.post(f'{BACKEND_URL}/transfer-orders/{to_id}/{action}', timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+
 def _dpi_color(dpi: float) -> list[int]:
     """0..1 DPI -> green->yellow->red RGBA."""
     dpi = max(0.0, min(1.0, dpi))
@@ -420,6 +441,95 @@ with map_col:
                     }
                 )
                 st.dataframe(bucket_df, hide_index=True, use_container_width=True)
+
+        st.markdown('---')
+        st.subheader('Inventory check — Transfer Orders')
+        st.caption('DEMO DATA: inventory levels and prior-season sales are synthetic, not from a real ERP feed. Workflow logic is real.')
+
+        if st.button('Run inventory check', key='inv_check_btn', type='primary'):
+            sid = st.session_state['active_scenario']['scenario_id'] if 'scenario_id' in st.session_state['active_scenario'] else None
+            # The activate response sometimes uses 'scenario_id' or just sits under 'name'. Pull it from active_scenario_geom for safety.
+            if sid is None:
+                sid = st.session_state.get('active_scenario_geom', {}).get('id')
+            if sid:
+                with st.spinner('Computing shortfalls + transfer orders...'):
+                    try:
+                        inv_result = run_inventory_check(sid)
+                        st.session_state['inventory_check'] = inv_result
+                    except httpx.HTTPError as e:
+                        st.error(f'Inventory check failed: {e}')
+
+        if 'inventory_check' in st.session_state:
+            ic = st.session_state['inventory_check']
+            m1, m2, m3 = st.columns(3)
+            m1.metric('Stores in cone', ic.get('stores_in_cone', 0))
+            m2.metric('SKU shortfalls', ic.get('shortfall_count', 0))
+            m3.metric('Transfer orders created', ic.get('transfer_orders_created', 0))
+            by_u = ic.get('by_urgency', {})
+            if by_u:
+                st.markdown('**By urgency:** ' + '  ·  '.join(f'{k}: {v}' for k, v in by_u.items()))
+            by_s = ic.get('by_source_type', {})
+            if by_s:
+                st.markdown('**By source:** ' + '  ·  '.join(f'{k}: {v}' for k, v in by_s.items()))
+
+            st.markdown('**Pending Transfer Orders — awaiting approval**')
+            status_filter = st.selectbox('Status filter',
+                options=['awaiting_approval','approved','rejected','any'],
+                index=0, key='to_status_filter')
+            limit = st.slider('Max rows', 10, 200, 30, key='to_limit')
+            api_status = None if status_filter == 'any' else status_filter
+            try:
+                tos = fetch_transfer_orders(status=api_status, limit=limit)
+            except httpx.HTTPError as e:
+                st.error(f'fetch TOs failed: {e}')
+                tos = {'orders': [], 'summary': {}}
+
+            st.caption(f"Showing {len(tos['orders'])} of {sum(tos['summary'].values())} total. Summary: {tos['summary']}")
+
+            if tos['orders']:
+                df = pd.DataFrame(tos['orders'])[
+                    ['to_id','source_type','source_name','dest_name','dest_county',
+                     'sku_id','units','urgency','status','rationale']
+                ].rename(columns={
+                    'to_id': 'TO#', 'source_type':'Type', 'source_name':'From',
+                    'dest_name':'To', 'dest_county':'County', 'sku_id':'SKU',
+                    'units':'Units', 'urgency':'Urgency', 'status':'Status',
+                    'rationale':'Why',
+                })
+                st.dataframe(df, hide_index=True, use_container_width=True)
+
+                # Bulk + per-row actions
+                b1, b2 = st.columns(2)
+                if b1.button('Approve all visible', key='bulk_approve'):
+                    for o in tos['orders']:
+                        if o['status'] == 'awaiting_approval':
+                            try:
+                                update_transfer_order(o['to_id'], 'approve')
+                            except httpx.HTTPError:
+                                pass
+                    st.success(f'Approved {len([o for o in tos["orders"] if o["status"] == "awaiting_approval"])} TOs')
+                    st.rerun()
+                if b2.button('Reject all visible', key='bulk_reject'):
+                    for o in tos['orders']:
+                        if o['status'] == 'awaiting_approval':
+                            try:
+                                update_transfer_order(o['to_id'], 'reject')
+                            except httpx.HTTPError:
+                                pass
+                    st.warning(f'Rejected visible TOs')
+                    st.rerun()
+
+                # Single-row picker
+                st.markdown('Single-TO action:')
+                c1, c2, c3 = st.columns([3,1,1])
+                pick = c1.selectbox('TO id', options=[o['to_id'] for o in tos['orders']],
+                                    key='single_to_pick', label_visibility='collapsed')
+                if c2.button('Approve', key='single_approve'):
+                    update_transfer_order(pick, 'approve'); st.rerun()
+                if c3.button('Reject', key='single_reject'):
+                    update_transfer_order(pick, 'reject'); st.rerun()
+            else:
+                st.info('No transfer orders match this filter.')
 
 with detail_col:
     st.subheader("County detail")

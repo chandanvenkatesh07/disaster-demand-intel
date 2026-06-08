@@ -37,6 +37,9 @@ from .scoring import (
     compute,
     compute_with_synthetic_alert,
 )
+from .inventory.replenishment import compute_shortfalls, compute_transfer_orders
+from .inventory.storage import persist_orders, list_orders, update_status, clear_all as clear_transfer_orders, summary as transfer_order_summary
+from collections import Counter
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 COUNTIES_GEOJSON = PROJECT_ROOT / "data" / "raw" / "fl_counties.geojson"
@@ -382,3 +385,70 @@ def clear_scenario_alerts() -> dict:
     finally:
         con.close()
     return {"cleared": True, "note": "call POST /refresh/alerts to re-pull live NOAA data."}
+
+
+@app.post("/scenarios/{scenario_id}/check-inventory")
+def check_inventory(scenario_id: str) -> dict:
+    scenario = SCENARIOS.get(scenario_id)
+    if not scenario:
+        raise HTTPException(status_code=404, detail=f"Scenario {scenario_id} not found")
+        
+    con = duckdb.connect(DB_PATH.as_posix())
+    try:
+        stores = con.execute("""
+            SELECT s.osm_id, s.lat, s.lon, s.name, sc.fips, sc.county_name AS county
+            FROM home_depot_store s LEFT JOIN store_county sc USING (osm_id)
+        """).fetchall()
+        stores_dicts = [
+            {"osm_id": r[0], "lat": r[1], "lon": r[2], "name": r[3], "fips": r[4], "county": r[5]}
+            for r in stores
+        ]
+        
+        risk_rows = con.execute("SELECT fips, risk_score FROM county_hazard WHERE hazard = 'hurricane'").fetchall()
+        risk_by_fips = {r[0]: r[1] for r in risk_rows}
+    finally:
+        con.close()
+        
+    prep_plan = compute_prep_plan(scenario, stores_dicts)
+    shortfalls = compute_shortfalls(prep_plan, stores_dicts, risk_by_fips)
+    orders = compute_transfer_orders(shortfalls, stores_dicts)
+    
+    clear_transfer_orders()
+    persist_orders(orders)
+    
+    return {
+        "scenario_id": scenario_id,
+        "name": scenario.name,
+        "stores_in_cone": len(prep_plan),
+        "shortfall_count": len(shortfalls),
+        "transfer_orders_created": len(orders),
+        "by_urgency": dict(Counter(o.urgency for o in orders)),
+        "by_source_type": dict(Counter(o.source_type for o in orders)),
+    }
+
+
+@app.get("/transfer-orders")
+def list_transfer_orders(
+    status: str | None = Query(None, regex='^(awaiting_approval|approved|rejected|fulfilled)$'),
+    limit: int = Query(500, le=1000),
+) -> dict:
+    orders = list_orders(status, limit)
+    return {
+        "count": len(orders),
+        "orders": orders,
+        "summary": transfer_order_summary(),
+    }
+
+
+@app.post("/transfer-orders/{to_id}/approve")
+def approve_transfer_order(to_id: str) -> dict:
+    if not update_status(to_id, 'approved'):
+        raise HTTPException(status_code=404, detail=f"TO {to_id} not found")
+    return {"to_id": to_id, "status": "approved"}
+
+
+@app.post("/transfer-orders/{to_id}/reject")
+def reject_transfer_order(to_id: str) -> dict:
+    if not update_status(to_id, 'rejected'):
+        raise HTTPException(status_code=404, detail=f"TO {to_id} not found")
+    return {"to_id": to_id, "status": "rejected"}
