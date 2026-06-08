@@ -9,3 +9,5 @@ runtime/
 .streamlit/secrets.toml
 .claude/
 *.egg-info/
+.aider*
+scripts/_dev_proxy.py
