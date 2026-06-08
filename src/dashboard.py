@@ -66,6 +66,29 @@ def refresh_alerts() -> dict:
     return r.json()
 
 
+def fetch_exec_summary(limit: int = 10) -> dict:
+    r = httpx.get(f"{BACKEND_URL}/summary/top", params={"limit": limit}, timeout=120)
+    r.raise_for_status()
+    return r.json()
+
+
+def search_regions(query: str) -> dict:
+    r = httpx.post(f"{BACKEND_URL}/regions/search",
+                   json={"query": query}, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_whatif(fips: str, event: str, severity: str, category: str) -> dict:
+    r = httpx.post(
+        f"{BACKEND_URL}/regions/{fips}/whatif",
+        json={"event": event, "severity": severity, "category": category},
+        timeout=120,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
 def _dpi_color(dpi: float) -> list[int]:
     """0..1 DPI -> green->yellow->red RGBA."""
     dpi = max(0.0, min(1.0, dpi))
@@ -112,6 +135,30 @@ def _store_layer(stores: list[dict]) -> pdk.Layer:
 st.sidebar.title("Disaster Demand Map")
 st.sidebar.caption("Florida vertical slice. Local LLM only — no paid APIs.")
 
+st.sidebar.markdown("**Search counties** (natural language)")
+nl_query = st.sidebar.text_input(
+    "e.g. coastal counties with old housing and few stores",
+    placeholder="type a question...",
+    label_visibility="collapsed",
+)
+nl_submit = st.sidebar.button("Search", use_container_width=True)
+if nl_query and nl_submit:
+    with st.sidebar.status("Parsing query with local LLM..."):
+        try:
+            search_result = search_regions(nl_query)
+        except httpx.HTTPError as e:
+            st.sidebar.error(f"Search failed: {e}")
+            search_result = None
+    if search_result is not None:
+        st.session_state["search_result"] = search_result
+
+if "search_result" in st.session_state and st.sidebar.button(
+    "Clear search", use_container_width=True
+):
+    del st.session_state["search_result"]
+
+st.sidebar.markdown("---")
+
 disaster_filter = st.sidebar.selectbox(
     "Filter to active disaster category",
     options=["(none)", "hurricane", "flood", "wildfire",
@@ -144,22 +191,57 @@ with st.sidebar.expander("Data sources", expanded=False):
 # ---------------- Data ----------------
 
 try:
-    regions = fetch_regions(filter_val)
+    # NL search result takes precedence over the disaster-category filter.
+    search_state = st.session_state.get("search_result")
+    if search_state:
+        regions = search_state["regions"]
+        # Hydrate the missing fields the dashboard expects on each row.
+        for r in regions:
+            r.setdefault("hazard_source", "fl_baseline_v1")
+            r.setdefault("active_alert_count", 0)
+            r.setdefault("active_categories", [])
+    else:
+        regions = fetch_regions(filter_val)
     stores = fetch_stores()
     counties_geo = _enrich_geojson(fetch_counties_geojson(), regions)
 except httpx.HTTPError as e:
     st.error(f"Backend unreachable at {BACKEND_URL}: {e}")
     st.stop()
 
+if search_state := st.session_state.get("search_result"):
+    st.info(
+        f"**Search:** _{search_state['query']}_  ·  "
+        f"**Parsed filter:** `{search_state['parsed_filter']}`  ·  "
+        f"{search_state['count']} matches"
+    )
+
 # ---------------- Header KPIs ----------------
 
-active_alert_total = sum(r["active_alert_count"] for r in regions)
+active_alert_total = sum(r.get("active_alert_count", 0) for r in regions)
 top_dpi = regions[0]["dpi"] if regions else 0.0
 col_k1, col_k2, col_k3, col_k4 = st.columns(4)
 col_k1.metric("Counties scored", len(regions))
 col_k2.metric("Home Depot stores", len(stores))
 col_k3.metric("Active NWS alerts (FL)", active_alert_total)
 col_k4.metric("Top DPI", f"{top_dpi:.3f}")
+
+with st.expander("Executive summary (local LLM, ~5-15s)", expanded=False):
+    summary_limit = st.slider("Counties to summarise", 5, 20, 10,
+                              key="exec_summary_limit")
+    if st.button("Generate executive summary", key="exec_summary_btn"):
+        with st.spinner("Asking local Qwen for a cluster summary..."):
+            try:
+                exec_data = fetch_exec_summary(summary_limit)
+                st.session_state["exec_summary"] = exec_data
+            except httpx.HTTPError as e:
+                st.error(f"Summary failed: {e}")
+    if "exec_summary" in st.session_state:
+        s = st.session_state["exec_summary"]["summary"]
+        st.markdown(f"**Summary:** {s['paragraph']}")
+        if s.get("themes"):
+            st.markdown("**Themes:**")
+            for t in s["themes"]:
+                st.markdown(f"- {t}")
 
 # ---------------- Layout: map + detail ----------------
 
@@ -289,7 +371,7 @@ with detail_col:
 
     st.markdown("---")
     if st.button("Generate local-LLM explanation",
-                 help="Calls Qwen3.6-35B-A3B on the Mac Studio. ~5-15s on first run.",
+                 help="Calls the local Qwen. ~5-15s on first run.",
                  type="primary"):
         with st.spinner("Asking local Qwen..."):
             exp = fetch_explanation(selected)
@@ -300,3 +382,56 @@ with detail_col:
             st.info(exp["explanation"]["stock_summary"])
         with st.expander("Exact JSON sent to the model"):
             st.code(json.dumps(exp["llm_payload"], indent=2), language="json")
+
+    st.markdown("---")
+    st.markdown("**What-if scenario**")
+    wi_col1, wi_col2 = st.columns(2)
+    with wi_col1:
+        wi_event = st.selectbox(
+            "Hypothetical event",
+            options=["Hurricane Warning", "Hurricane Watch",
+                     "Tropical Storm Warning", "Storm Surge Warning",
+                     "Flood Warning", "Flash Flood Warning",
+                     "Tornado Warning", "Excessive Heat Warning",
+                     "Red Flag Warning"],
+            key="wi_event",
+        )
+    with wi_col2:
+        wi_severity = st.selectbox(
+            "Severity",
+            options=["Extreme", "Severe", "Moderate", "Minor"],
+            key="wi_severity",
+        )
+    event_to_category = {
+        "Hurricane Warning": "hurricane", "Hurricane Watch": "hurricane",
+        "Tropical Storm Warning": "hurricane",
+        "Storm Surge Warning": "hurricane",
+        "Flood Warning": "flood", "Flash Flood Warning": "flood",
+        "Tornado Warning": "tornado",
+        "Excessive Heat Warning": "heat_wave",
+        "Red Flag Warning": "wildfire",
+    }
+    if st.button("Run what-if", key="wi_btn"):
+        with st.spinner("Recomputing + asking local Qwen..."):
+            try:
+                wi = fetch_whatif(
+                    selected, wi_event, wi_severity,
+                    event_to_category.get(wi_event, "hurricane"),
+                )
+            except httpx.HTTPError as e:
+                st.error(f"What-if failed: {e}")
+                wi = None
+        if wi:
+            delta_dpi = wi["delta"]["dpi"]
+            st.metric("DPI shift",
+                      f"{wi['before']['dpi']:.3f} → {wi['after']['dpi']:.3f}",
+                      delta=f"{delta_dpi:+.3f}")
+            new_items = wi["delta"].get("new_items") or []
+            if new_items:
+                st.markdown(
+                    f"**New stock items now in scope:** {', '.join(new_items)}"
+                )
+            for b in wi["explanation"]["bullets"]:
+                st.markdown(f"- {b}")
+            with st.expander("Sub-score deltas"):
+                st.json(wi["delta"]["sub_scores"])

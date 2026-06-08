@@ -98,6 +98,77 @@ Do not include any other top-level keys. Do not include example or
 placeholder text in the output."""
 
 
+EXEC_SUMMARY_PROMPT = """You are summarising a ranked list of counties for a
+regional operations manager. You receive a JSON array of pre-computed county
+facts. Output one short paragraph (3 to 5 sentences) describing the cluster
+as a whole: which sub-regions or county types dominate, what hazard profile
+drives the high ranks, and what stocking themes recur across the top entries.
+
+Rules:
+  - Use only the facts in the payload (county names, populations, DPI values,
+    active categories, top hazards). Do not invent numbers.
+  - Cite specific counties by name.
+  - Do not list every county individually — describe patterns.
+  - No safety or emergency instructions.
+
+Also produce 3 short "themes" — one-liners capturing the main stocking takeaways.
+
+Return ONLY this JSON object, no prose, no fence:
+  { "paragraph": "...", "themes": ["...", "...", "..."] }
+"""
+
+
+SEARCH_PARSE_PROMPT = """Translate a natural-language filter request into a
+structured filter object. Output ONLY a JSON object using these optional keys
+— no prose, no fence, no extra keys:
+
+  min_population, max_population        integer
+  min_store_count, max_store_count      integer
+  min_older_housing_score               0..1 float
+  max_older_housing_score               0..1 float
+  min_dpi, max_dpi                      0..1 float
+  require_hazard                        one of: hurricane, flood, wildfire,
+                                        heat_wave, tornado, hail, winter_storm
+  min_hazard_score                      0..1 float (paired with require_hazard)
+  require_active_alert                  true | false
+  active_category                       same enum as require_hazard
+  region                                one of: coastal, inland, panhandle,
+                                        north, central, south
+  sort_by                               one of: dpi, population, store_count,
+                                        hazard_score (default dpi)
+  limit                                 integer (default 20, max 67)
+
+Examples:
+  "coastal counties with old housing"
+    -> {"region":"coastal","min_older_housing_score":0.6}
+  "top 5 hurricane-exposed metros"
+    -> {"require_hazard":"hurricane","min_hazard_score":0.8,"min_population":500000,"limit":5}
+  "counties with few stores"
+    -> {"max_store_count":3,"sort_by":"store_count"}
+  "south florida with active alerts"
+    -> {"region":"south","require_active_alert":true}
+
+Omit any key you are not confident about. Do not invent fields. If the request
+is unclear, return {} so the caller can show all counties."""
+
+
+WHATIF_PROMPT = """A county's demand profile has been recomputed with a
+HYPOTHETICAL NWS alert injected. Compare BEFORE and AFTER for an ops manager.
+
+Rules:
+  - The alert is hypothetical. Say so explicitly in at least one bullet.
+  - Use only the numbers in the payload. Do not invent.
+  - Output 3 bullets covering:
+      (a) which sub-scores changed and by how much,
+      (b) which stock items become critical that were not before,
+      (c) practical implication for staffing or supply routing.
+  - No public safety instructions.
+
+Return ONLY this JSON object, no prose, no fence:
+  { "bullets": ["...", "...", "..."] }
+"""
+
+
 class LLMClient:
     def __init__(self, config: GatewayConfig | None = None):
         self.config = config or GatewayConfig.from_env()
@@ -175,6 +246,126 @@ class LLMClient:
         parsed = self._parse_explanation(raw)
         self._cache_put(cache_key, parsed)
         return parsed
+
+    def executive_summary(self, top_regions: list[dict]) -> dict:
+        """Return {"paragraph": str, "themes": [str, str, str]} for the cluster."""
+        cache_key = self._exec_cache_key(top_regions)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+        user_msg = (
+            "Ranked counties (top to bottom):\n"
+            f"{json.dumps(top_regions, indent=2)}\n\n"
+            "Respond with the JSON object only."
+        )
+        raw = self._chat(
+            messages=[
+                {"role": "system", "content": EXEC_SUMMARY_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            max_tokens=600,
+            temperature=0.2,
+        )
+        parsed = self._parse_exec_summary(raw)
+        self._cache_put(cache_key, parsed)
+        return parsed
+
+    def parse_search_query(self, query: str) -> dict:
+        """Translate NL query to a filter dict. Returns {} if unparseable."""
+        user_msg = f"Request: {query}\n\nRespond with the JSON object only."
+        raw = self._chat(
+            messages=[
+                {"role": "system", "content": SEARCH_PARSE_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            max_tokens=300,
+            temperature=0.0,
+        )
+        cleaned = _THINK_BLOCK.sub("", raw).strip()
+        for c in self._json_candidates(cleaned):
+            try:
+                obj = json.loads(c)
+                if isinstance(obj, dict):
+                    return obj
+            except json.JSONDecodeError:
+                continue
+        return {}
+
+    def explain_whatif(self, region_name: str, hypothetical: dict,
+                       before: dict, after: dict, delta: dict) -> dict:
+        """Return {"bullets": [...]} describing a hypothetical-alert scenario."""
+        payload = {
+            "region": region_name,
+            "hypothetical_alert": hypothetical,
+            "before": before,
+            "after": after,
+            "delta": delta,
+        }
+        user_msg = (
+            f"Scenario payload:\n{json.dumps(payload, indent=2)}\n\n"
+            "Respond with the JSON object only."
+        )
+        raw = self._chat(
+            messages=[
+                {"role": "system", "content": WHATIF_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            max_tokens=500,
+            temperature=0.2,
+        )
+        cleaned = _THINK_BLOCK.sub("", raw).strip()
+        for c in self._json_candidates(cleaned):
+            try:
+                obj = json.loads(c)
+                bullets = obj.get("bullets") or []
+                if isinstance(bullets, list) and bullets:
+                    return {"bullets": [str(b).strip() for b in bullets[:5]]}
+            except json.JSONDecodeError:
+                continue
+        return {"bullets": [cleaned[:300] or "(Model returned no parseable answer.)"]}
+
+    @staticmethod
+    def _json_candidates(cleaned: str) -> list[str]:
+        out: list[str] = []
+        fenced = _FENCED_JSON.search(cleaned)
+        if fenced:
+            out.append(fenced.group(1))
+        if cleaned.startswith("{"):
+            out.append(cleaned)
+        first, last = cleaned.find("{"), cleaned.rfind("}")
+        if 0 <= first < last:
+            out.append(cleaned[first : last + 1])
+        return out
+
+    @classmethod
+    def _parse_exec_summary(cls, raw: str) -> dict:
+        cleaned = _THINK_BLOCK.sub("", raw).strip()
+        for c in cls._json_candidates(cleaned):
+            try:
+                obj = json.loads(c)
+            except json.JSONDecodeError:
+                continue
+            paragraph = str(obj.get("paragraph") or "").strip()
+            themes = obj.get("themes") or []
+            if paragraph:
+                return {
+                    "paragraph": paragraph,
+                    "themes": [str(t).strip() for t in themes[:5]],
+                }
+        return {"paragraph": cleaned[:600] or "(no summary)", "themes": []}
+
+    @staticmethod
+    def _exec_cache_key(top: list[dict]) -> str:
+        canonical = json.dumps(
+            {
+                "fips": [r.get("fips") for r in top],
+                "dpis": [round(r.get("dpi", 0.0), 3) for r in top],
+                "version": SCORING_VERSION,
+                "kind": "exec_summary",
+            },
+            sort_keys=True,
+        )
+        return "summary-" + hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
     @staticmethod
     def _parse_explanation(raw: str) -> dict:

@@ -21,10 +21,16 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
 from .ingest.noaa_alerts import ingest as refresh_noaa_alerts
 from .llm_client import LLMClient
-from .scoring import CountyScore, compute
+from .scoring import (
+    CountyScore,
+    apply_filter,
+    compute,
+    compute_with_synthetic_alert,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 COUNTIES_GEOJSON = PROJECT_ROOT / "data" / "raw" / "fl_counties.geojson"
@@ -155,3 +161,92 @@ def counties_geojson() -> FileResponse:
 @app.post("/refresh/alerts")
 def refresh_alerts() -> dict:
     return refresh_noaa_alerts()
+
+
+def _exec_payload(s: CountyScore) -> dict:
+    top_haz = max(s.hazard_scores.items(), key=lambda kv: kv[1], default=(None, 0))
+    return {
+        "fips": s.fips,
+        "name": s.name,
+        "dpi": s.dpi,
+        "population": s.population,
+        "store_count": s.store_count,
+        "stores_per_100k": s.stores_per_100k,
+        "active_categories": s.active_categories,
+        "active_alert_count": len(s.active_alerts),
+        "top_hazard": top_haz[0],
+        "top_hazard_score": round(top_haz[1], 3),
+        "recommended_items": s.recommended_items[:5],
+    }
+
+
+@app.get("/summary/top")
+def exec_summary(limit: int = Query(10, ge=3, le=25)) -> dict:
+    scores = compute()[:limit]
+    payload = [_exec_payload(s) for s in scores]
+    with LLMClient() as c:
+        summary = c.executive_summary(payload)
+    return {"limit": limit, "regions": payload, "summary": summary}
+
+
+class SearchBody(BaseModel):
+    query: str = Field(..., min_length=2, max_length=300)
+
+
+@app.post("/regions/search")
+def search_regions(body: SearchBody) -> dict:
+    scores = compute()
+    with LLMClient() as c:
+        parsed = c.parse_search_query(body.query)
+    filtered = apply_filter(scores, parsed)
+    return {
+        "query": body.query,
+        "parsed_filter": parsed,
+        "count": len(filtered),
+        "regions": [_score_to_summary(s) for s in filtered],
+    }
+
+
+class WhatIfBody(BaseModel):
+    event: str = Field(..., min_length=2, max_length=80)
+    severity: str = Field(default="Severe")
+    category: str = Field(default="hurricane")
+
+
+@app.post("/regions/{fips}/whatif")
+def whatif(fips: str, body: WhatIfBody) -> dict:
+    try:
+        before, after, delta = compute_with_synthetic_alert(
+            fips=fips, event=body.event,
+            severity=body.severity, category=body.category,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    def _slim(s: CountyScore) -> dict:
+        return {
+            "dpi": s.dpi,
+            "sub_scores": s.sub_scores,
+            "active_categories": s.active_categories,
+            "recommended_items": s.recommended_items,
+        }
+
+    with LLMClient() as c:
+        explanation = c.explain_whatif(
+            region_name=before.name,
+            hypothetical={"event": body.event, "severity": body.severity,
+                          "category": body.category},
+            before=_slim(before),
+            after=_slim(after),
+            delta=delta,
+        )
+    return {
+        "fips": fips,
+        "name": before.name,
+        "hypothetical": {"event": body.event, "severity": body.severity,
+                         "category": body.category},
+        "before": _slim(before),
+        "after": _slim(after),
+        "delta": delta,
+        "explanation": explanation,
+    }

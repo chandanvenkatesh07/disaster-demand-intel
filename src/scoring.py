@@ -19,6 +19,8 @@ from pathlib import Path
 
 import duckdb
 
+from .geo_regions import is_coastal, matches_region
+from .ingest.noaa_alerts import SEVERITY_SCORE
 from .stock_map import STOCK_PLANS, merge_plans
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -230,6 +232,154 @@ def compute(con: duckdb.DuckDBPyConnection | None = None) -> list[CountyScore]:
 
 def to_dicts(scores: list[CountyScore]) -> list[dict]:
     return [asdict(s) for s in scores]
+
+
+def compute_with_synthetic_alert(
+    fips: str, event: str, severity: str, category: str,
+) -> tuple[CountyScore, CountyScore, dict]:
+    """Recompute the named county as if one extra NWS alert were active.
+
+    Returns (before, after, delta) — both full CountyScore objects plus a dict
+    of sub_score deltas and DPI delta. Used for the what-if endpoint; does not
+    mutate any DuckDB tables.
+    """
+    baseline = compute()
+    before = next((s for s in baseline if s.fips == fips), None)
+    if before is None:
+        raise ValueError(f"FIPS {fips} not found")
+
+    synthetic = {
+        "alert_id": f"synthetic://{fips}/{event}",
+        "event": event,
+        "category": category,
+        "severity": severity,
+        "severity_score": SEVERITY_SCORE.get(severity, 0.6),
+        "headline": f"Hypothetical: {event}",
+        "expires": None,
+    }
+    # Inject and re-derive only this county's sub-scores. Pop/store-coverage
+    # normalisation across the panel doesn't change because we're only
+    # touching one row's active_alerts.
+    new_active = list(before.active_alerts) + [synthetic]
+    cats = sorted({a["category"] for a in new_active})
+    haz = before.hazard_scores
+
+    forecast_impact = max(
+        a["severity_score"] * (0.5 + 0.5 * haz.get(a["category"], 0.0))
+        for a in new_active
+    )
+
+    plan = merge_plans(cats)
+    stock_urgency = plan["urgency"]
+    items = plan["items"]
+
+    sub = dict(before.sub_scores)
+    sub["forecast_impact"] = round(forecast_impact, 4)
+    sub["stock_urgency"] = round(stock_urgency, 4)
+    dpi = sum(WEIGHTS[k] * v for k, v in sub.items())
+
+    after = CountyScore(
+        fips=before.fips, name=before.name,
+        population=before.population, housing_units=before.housing_units,
+        owner_occupied_units=before.owner_occupied_units,
+        older_housing_score=before.older_housing_score,
+        store_count=before.store_count, stores_per_100k=before.stores_per_100k,
+        active_categories=cats, active_alerts=new_active,
+        hazard_scores=haz, sub_scores=sub, dpi=round(dpi, 4),
+        recommended_items=items, stock_urgency_driver=stock_urgency,
+        hazard_source=before.hazard_source,
+    )
+
+    delta = {
+        "dpi": round(after.dpi - before.dpi, 4),
+        "sub_scores": {k: round(sub[k] - before.sub_scores[k], 4)
+                       for k in WEIGHTS},
+        "added_categories": sorted(set(cats) - set(before.active_categories)),
+        "new_items": [i for i in items if i not in before.recommended_items],
+    }
+    return before, after, delta
+
+
+_HAZARD_KEYS = {"hurricane", "flood", "wildfire", "heat_wave",
+                "tornado", "hail", "winter_storm", "river_flood"}
+_SORT_KEYS = {"dpi", "population", "store_count", "hazard_score"}
+
+
+def apply_filter(scores: list[CountyScore], f: dict) -> list[CountyScore]:
+    """Apply a constrained filter dict (as produced by LLMClient.parse_search_query)
+    to a list of CountyScore. Unknown keys are ignored. Returns a new list."""
+    out = list(scores)
+
+    def _num(key: str) -> float | None:
+        v = f.get(key)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _int(key: str) -> int | None:
+        v = f.get(key)
+        try:
+            return int(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    minp, maxp = _int("min_population"), _int("max_population")
+    if minp is not None:
+        out = [s for s in out if s.population >= minp]
+    if maxp is not None:
+        out = [s for s in out if s.population <= maxp]
+    minst, maxst = _int("min_store_count"), _int("max_store_count")
+    if minst is not None:
+        out = [s for s in out if s.store_count >= minst]
+    if maxst is not None:
+        out = [s for s in out if s.store_count <= maxst]
+    minoh, maxoh = _num("min_older_housing_score"), _num("max_older_housing_score")
+    if minoh is not None:
+        out = [s for s in out if s.older_housing_score >= minoh]
+    if maxoh is not None:
+        out = [s for s in out if s.older_housing_score <= maxoh]
+    mindpi, maxdpi = _num("min_dpi"), _num("max_dpi")
+    if mindpi is not None:
+        out = [s for s in out if s.dpi >= mindpi]
+    if maxdpi is not None:
+        out = [s for s in out if s.dpi <= maxdpi]
+
+    require_hazard = f.get("require_hazard")
+    if require_hazard in _HAZARD_KEYS:
+        min_hs = _num("min_hazard_score") or 0.0
+        out = [s for s in out
+               if s.hazard_scores.get(require_hazard, 0.0) >= min_hs]
+
+    if f.get("require_active_alert"):
+        out = [s for s in out if s.active_alerts]
+    active_cat = f.get("active_category")
+    if active_cat in _HAZARD_KEYS:
+        out = [s for s in out if active_cat in s.active_categories]
+
+    region = f.get("region")
+    if region:
+        out = [s for s in out if matches_region(s.fips, region)]
+
+    sort_by = (f.get("sort_by") or "dpi").lower()
+    if sort_by not in _SORT_KEYS:
+        sort_by = "dpi"
+    if sort_by == "dpi":
+        out.sort(key=lambda s: s.dpi, reverse=True)
+    elif sort_by == "population":
+        out.sort(key=lambda s: s.population, reverse=True)
+    elif sort_by == "store_count":
+        out.sort(key=lambda s: s.store_count)
+    elif sort_by == "hazard_score":
+        key = require_hazard if require_hazard in _HAZARD_KEYS else None
+        out.sort(
+            key=lambda s: (s.hazard_scores.get(key, 0.0) if key
+                           else max(s.hazard_scores.values(), default=0.0)),
+            reverse=True,
+        )
+
+    limit = _int("limit") or 20
+    return out[: max(1, min(67, limit))]
 
 
 if __name__ == "__main__":
