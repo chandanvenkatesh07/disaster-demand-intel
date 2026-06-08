@@ -1,18 +1,22 @@
 """Pull active NOAA / National Weather Service alerts for Florida.
 
+Hurricane-only build: we only ingest events that signal a tropical-system
+impact (hurricane, tropical storm, storm surge, and flash-flooding from a
+tropical event). Everything else is dropped at parse time.
+
 NWS API:
   - Free, no key. Requires a User-Agent identifying the app per their TOS.
   - GeoJSON response with one Feature per active alert.
 
 Each alert has:
-  properties.event       e.g. "Hurricane Warning", "Heat Advisory"
+  properties.event       e.g. "Hurricane Warning"
   properties.severity    Extreme | Severe | Moderate | Minor | Unknown
   properties.areaDesc    "Miami-Dade, FL; Monroe, FL"
   properties.geocode.SAME  list of SAME 6-digit codes; "0" + 5-digit county FIPS
   properties.expires     ISO 8601
 
-We map each alert to (county_fips, disaster_category, severity_score) rows so
-the scoring step can join directly.
+We map each alert to (county_fips, 'hurricane', severity_score) rows so the
+scoring step can join directly.
 """
 
 from __future__ import annotations
@@ -40,10 +44,11 @@ SEVERITY_SCORE = {
     "Unknown": 0.4,
 }
 
-# NWS event types -> our disaster categories. Anything not listed is dropped
-# (e.g. air-quality, marine-only events that don't drive retail demand).
+# Hurricane-only build: only ingest events tied to a tropical system. Flash
+# Flood Warnings are included because in Florida they're almost always a
+# tropical-rain product; if you wanted to be stricter you'd require an active
+# Tropical alert in the same county before counting them.
 EVENT_TO_CATEGORY = {
-    # Tropical
     "Hurricane Warning": "hurricane",
     "Hurricane Watch": "hurricane",
     "Hurricane Force Wind Warning": "hurricane",
@@ -53,40 +58,9 @@ EVENT_TO_CATEGORY = {
     "Storm Surge Watch": "hurricane",
     "Tropical Depression Statement": "hurricane",
     "Extreme Wind Warning": "hurricane",
-    # Flood
-    "Flood Warning": "flood",
-    "Flood Watch": "flood",
-    "Flash Flood Warning": "flood",
-    "Flash Flood Watch": "flood",
-    "Coastal Flood Warning": "flood",
-    "Coastal Flood Watch": "flood",
-    "Coastal Flood Advisory": "flood",
-    "River Flood Warning": "flood",
-    "River Flood Watch": "flood",
-    # Fire / wildfire
-    "Red Flag Warning": "wildfire",
-    "Fire Weather Watch": "wildfire",
-    "Fire Warning": "wildfire",
-    "Air Quality Alert": "wildfire",
-    # Winter
-    "Winter Storm Warning": "winter_storm",
-    "Winter Storm Watch": "winter_storm",
-    "Blizzard Warning": "winter_storm",
-    "Ice Storm Warning": "winter_storm",
-    "Hard Freeze Warning": "winter_storm",
-    "Freeze Warning": "winter_storm",
-    "Winter Weather Advisory": "winter_storm",
-    # Heat
-    "Extreme Heat Warning": "heat_wave",
-    "Excessive Heat Warning": "heat_wave",
-    "Extreme Heat Watch": "heat_wave",
-    "Excessive Heat Watch": "heat_wave",
-    "Heat Advisory": "heat_wave",
-    # Severe storms / tornado / hail
-    "Tornado Warning": "tornado",
-    "Tornado Watch": "tornado",
-    "Severe Thunderstorm Warning": "tornado",
-    "Severe Thunderstorm Watch": "tornado",
+    "Flash Flood Warning": "hurricane",
+    "Flood Warning": "hurricane",
+    "Coastal Flood Warning": "hurricane",
 }
 
 

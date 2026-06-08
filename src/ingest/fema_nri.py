@@ -147,8 +147,9 @@ FL_COUNTY_NAMES: dict[str, str] = {
     "12127":"Volusia","12129":"Wakulla","12131":"Walton","12133":"Washington",
 }
 
-HAZARDS = ["hurricane", "flood", "river_flood", "wildfire",
-           "winter_storm", "heat_wave", "tornado", "hail"]
+# Hurricane-only build: we keep the FL_BASELINE dict intact so a future
+# multi-hazard expansion is easy, but ingest writes hurricane scores only.
+HAZARDS = ["hurricane"]
 
 
 @dataclass

@@ -19,7 +19,7 @@ from shapely.geometry import LineString, mapping
 BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
 
 st.set_page_config(
-    page_title="Home Depot Disaster Demand Map — FL",
+    page_title="Florida Hurricane Demand Map",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -204,8 +204,8 @@ def _scenario_layers(geom: dict) -> list[pdk.Layer]:
 
 # ---------------- Sidebar ----------------
 
-st.sidebar.title("Disaster Demand Map")
-st.sidebar.caption("Florida vertical slice. Local LLM only — no paid APIs.")
+st.sidebar.title("FL Hurricane Demand")
+st.sidebar.caption("Hurricane-only build. Local LLM only — no paid APIs.")
 
 with st.sidebar.expander("Example scenarios", expanded=False):
     scenarios = fetch_scenarios()
@@ -229,13 +229,14 @@ if "active_scenario" in st.session_state:
 
 st.sidebar.markdown("---")
 
-disaster_filter = st.sidebar.selectbox(
-    "Filter to active disaster category",
-    options=["(none)", "hurricane", "flood", "wildfire",
-             "winter_storm", "heat_wave", "tornado"],
-    index=0,
+# Hurricane is the only category in this build; the API filter is kept for
+# forward-compat but we just hard-wire to "show all counties with any active
+# hurricane alert" or "show every county". One checkbox is enough UI.
+only_active = st.sidebar.checkbox(
+    "Show only counties with an active hurricane alert", value=False,
 )
-filter_val = None if disaster_filter == "(none)" else disaster_filter
+filter_val = "hurricane" if only_active else None
+disaster_filter = "hurricane" if only_active else "(none)"
 
 if st.sidebar.button("Refresh NOAA alerts"):
     with st.sidebar.status("Pulling api.weather.gov..."):
@@ -292,7 +293,7 @@ top_dpi = regions[0]["dpi"] if regions else 0.0
 col_k1, col_k2, col_k3, col_k4 = st.columns(4)
 col_k1.metric("Counties scored", len(regions))
 col_k2.metric("Home Depot stores", len(stores))
-col_k3.metric("Active NWS alerts (FL)", active_alert_total)
+col_k3.metric("Active hurricane alerts", active_alert_total)
 col_k4.metric("Top DPI", f"{top_dpi:.3f}")
 
 if "active_scenario" in st.session_state:
@@ -388,7 +389,8 @@ with map_col:
         st.markdown("---")
         st.subheader("Store preparation plan")
         prep_plan = st.session_state["active_scenario"]["prep_plan"]
-        buckets = ["T-0", "T-12h", "T-24h", "T-48h", "T-72h+"]
+        buckets = ["T-6h", "T-12h", "T-24h", "T-2d", "T-3d", "T-4d",
+                   "T-5d", "T-5d+", "Past"]
         bucket_counts = defaultdict(int)
         for entry in prep_plan:
             bucket_counts[entry["time_bucket"]] += 1
@@ -502,12 +504,10 @@ with detail_col:
     wi_col1, wi_col2 = st.columns(2)
     with wi_col1:
         wi_event = st.selectbox(
-            "Hypothetical event",
+            "Hypothetical hurricane event",
             options=["Hurricane Warning", "Hurricane Watch",
                      "Tropical Storm Warning", "Storm Surge Warning",
-                     "Flood Warning", "Flash Flood Warning",
-                     "Tornado Warning", "Excessive Heat Warning",
-                     "Red Flag Warning"],
+                     "Flash Flood Warning"],
             key="wi_event",
         )
     with wi_col2:
@@ -516,21 +516,11 @@ with detail_col:
             options=["Extreme", "Severe", "Moderate", "Minor"],
             key="wi_severity",
         )
-    event_to_category = {
-        "Hurricane Warning": "hurricane", "Hurricane Watch": "hurricane",
-        "Tropical Storm Warning": "hurricane",
-        "Storm Surge Warning": "hurricane",
-        "Flood Warning": "flood", "Flash Flood Warning": "flood",
-        "Tornado Warning": "tornado",
-        "Excessive Heat Warning": "heat_wave",
-        "Red Flag Warning": "wildfire",
-    }
     if st.button("Run what-if", key="wi_btn"):
         with st.spinner("Recomputing + asking local Qwen..."):
             try:
                 wi = fetch_whatif(
-                    selected, wi_event, wi_severity,
-                    event_to_category.get(wi_event, "hurricane"),
+                    selected, wi_event, wi_severity, "hurricane",
                 )
             except httpx.HTTPError as e:
                 st.error(f"What-if failed: {e}")

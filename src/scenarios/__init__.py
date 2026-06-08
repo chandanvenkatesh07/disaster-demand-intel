@@ -38,3 +38,8 @@ class Scenario:
     description: str
     paths: tuple[StormPath, ...]
     synthetic_alerts: tuple[SyntheticAlert, ...]
+    # Where the storm is "now" relative to landfall, in hours. 0 = landfall is
+    # happening now; -120 = storm is 5 days out at sea. Each store's prep
+    # window is computed as (path_hours_at_store - now_hours_to_landfall),
+    # so the scenario clock controls the entire prep-time view.
+    now_hours_to_landfall: float = 0.0

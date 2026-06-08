@@ -1,6 +1,7 @@
-"""Static disaster-category → stock-category map and urgency weights.
+"""Hurricane stock plan.
 
-Mirrors the table in the project spec. Pure-Python, no LLM, no I/O.
+This repo is scoped to hurricanes. Storm surge, flash floods during a tropical
+event, and tropical storm conditions all share the hurricane stock list.
 """
 
 from __future__ import annotations
@@ -15,74 +16,28 @@ class StockPlan:
     items: tuple[str, ...]
 
 
-STOCK_PLANS: dict[str, StockPlan] = {
-    "hurricane": StockPlan(
-        category="hurricane",
-        urgency=1.00,
-        items=("plywood", "tarps", "generators", "batteries",
-               "flashlights", "chainsaws", "roof repair supplies"),
+HURRICANE_PLAN = StockPlan(
+    category="hurricane",
+    urgency=1.00,
+    items=(
+        "plywood", "tarps", "generators", "batteries", "flashlights",
+        "chainsaws", "roof repair supplies", "sandbags", "sump pumps",
+        "wet/dry vacs", "contractor bags", "gloves",
     ),
-    "flood": StockPlan(
-        category="flood",
-        urgency=0.90,
-        items=("sump pumps", "wet/dry vacs", "fans", "dehumidifiers",
-               "mold remediation supplies", "contractor bags", "gloves"),
-    ),
-    "river_flood": StockPlan(
-        category="flood",
-        urgency=0.90,
-        items=("sump pumps", "wet/dry vacs", "sandbags", "fans",
-               "dehumidifiers", "contractor bags"),
-    ),
-    "wildfire": StockPlan(
-        category="wildfire",
-        urgency=0.85,
-        items=("respirators", "air filters", "air purifiers", "hoses",
-               "fire extinguishers", "defensible-space tools"),
-    ),
-    "winter_storm": StockPlan(
-        category="winter_storm",
-        urgency=0.80,
-        items=("snow shovels", "ice melt", "pipe insulation", "generators",
-               "heaters", "roof rakes"),
-    ),
-    "heat_wave": StockPlan(
-        category="heat_wave",
-        urgency=0.70,
-        items=("fans", "portable AC units", "water storage", "coolers",
-               "shade supplies"),
-    ),
-    "tornado": StockPlan(
-        category="tornado",
-        urgency=0.85,
-        items=("tarps", "plywood", "roof patching", "flashlights",
-               "batteries", "chainsaws", "cleanup tools"),
-    ),
-    "hail": StockPlan(
-        category="hail",
-        urgency=0.65,
-        items=("tarps", "roof patching", "window-covering plywood",
-               "cleanup tools"),
-    ),
-}
+)
+
+
+STOCK_PLANS: dict[str, StockPlan] = {"hurricane": HURRICANE_PLAN}
 
 
 def merge_plans(categories: list[str]) -> dict:
-    """For a set of active disaster categories, return the union of stock items
-    plus the max urgency across categories."""
+    """Hurricane is the only category in this build, but the signature is
+    preserved so the scoring/api layers keep working unchanged."""
     cats = [c for c in categories if c in STOCK_PLANS]
     if not cats:
         return {"urgency": 0.0, "items": [], "drivers": []}
-    seen: set[str] = set()
-    items: list[str] = []
-    for c in cats:
-        for it in STOCK_PLANS[c].items:
-            if it not in seen:
-                seen.add(it)
-                items.append(it)
-    urgency = max(STOCK_PLANS[c].urgency for c in cats)
     return {
-        "urgency": urgency,
-        "items": items,
+        "urgency": HURRICANE_PLAN.urgency,
+        "items": list(HURRICANE_PLAN.items),
         "drivers": cats,
     }

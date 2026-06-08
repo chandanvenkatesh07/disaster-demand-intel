@@ -314,6 +314,7 @@ def get_scenario(scenario_id: str) -> dict:
         "paths": paths_out,
         "synthetic_alerts": alerts_out,
         "affected_fips_union": sorted(affected_fips),
+        "now_hours_to_landfall": scenario.now_hours_to_landfall,
     }
 
 

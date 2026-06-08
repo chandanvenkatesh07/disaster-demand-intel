@@ -1,9 +1,10 @@
-# Disaster Demand Intel
+# Florida Hurricane Demand Intel
 
-A small dashboard that ranks U.S. counties by how much disaster-driven
-home-improvement demand they're likely to see next. Built as a Florida slice
-first; the ingest modules are state-parameterized so expanding to CONUS is a
-filter swap.
+A small dashboard that ranks Florida counties by hurricane-driven
+home-improvement demand and lays out a per-store preparation plan when a
+named scenario is active. The architecture is generalizable to other
+disasters and regions, but this build is **hurricane-only, Florida-only**
+on purpose.
 
 Ranking is fully deterministic. A local LLM (OpenAI-compatible endpoint) is
 used only to explain a region's score in plain English — it never invents
@@ -14,23 +15,29 @@ numbers, inventory, or forecasts.
 - Choropleth of Florida counties colored by **Demand Priority Index** (DPI).
 - All Home Depot store locations from OpenStreetMap, plotted as points.
 - Top-10 counties table with score breakdown.
-- Per-county detail panel: weighted sub-scores, baseline hazard scores, active
-  NWS alerts, recommended stock categories.
+- Per-county detail panel: weighted sub-scores, hurricane risk score, active
+  hurricane alerts, recommended stock categories.
 - "Generate explanation" button → 3-5 grounded bullets + a one-sentence stock
   summary from the local LLM. Cached on disk.
+- **Example Scenarios** (sidebar): four pre-built hurricane situations —
+  Charley 2004 (landfall now), Wilma 2005 (T-24h), two-path forecast cone
+  (T-48h), and an Atlantic approach 5 days out. Each renders the storm track,
+  cone of uncertainty, synthetic NWS alerts, and a per-store preparation plan
+  bucketed across T-6h / T-12h / T-24h / T-2d / ... / T-5d+.
 
 ## Scoring
 
 ```
-DPI = 0.40 · forecast_impact      # severity of active NWS alerts × matching hazard score
+DPI = 0.40 · forecast_impact      # severity of active hurricane alerts × hurricane risk
     + 0.25 · pop_size              # log-normalized county population
-    + 0.15 · stock_urgency         # disaster-type → urgency table
-    + 0.10 · housing_exposure      # peak hazard × older-housing factor
+    + 0.15 · stock_urgency         # hurricane stocking urgency (constant for this build)
+    + 0.10 · housing_exposure      # hurricane risk × older-housing factor
     + 0.10 · store_coverage_gap    # 1 - normalized(stores per 100k pop)
 ```
 
-When no NWS alerts are active, `forecast_impact` is zero and the ranking is
-driven entirely by baseline hazard × pop × housing × coverage gap.
+When no hurricane alerts are active, `forecast_impact` is zero and the
+ranking is driven entirely by baseline hurricane risk × pop × housing ×
+coverage gap.
 
 ## Data sources
 
@@ -156,6 +163,9 @@ GET  /healthz
 
 ## Known limitations
 
+- Hurricane only. Other disaster types (wildfire, winter storms, etc.) were
+  stripped in this build; the dataclasses still accept them so re-adding is
+  a matter of populating `STOCK_PLANS` and `EVENT_TO_CATEGORY` again.
 - FL only. Expanding to CONUS means relaxing the `state=12` filter in each
   ingest module and replacing the hazard baseline with real FEMA NRI.
 - Hazard baseline is a stand-in for the official FEMA NRI scores. See above

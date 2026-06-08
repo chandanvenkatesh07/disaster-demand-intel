@@ -300,8 +300,7 @@ def compute_with_synthetic_alert(
     return before, after, delta
 
 
-_HAZARD_KEYS = {"hurricane", "flood", "wildfire", "heat_wave",
-                "tornado", "hail", "winter_storm", "river_flood"}
+_HAZARD_KEYS = {"hurricane"}
 _SORT_KEYS = {"dpi", "population", "store_count", "hazard_score"}
 
 

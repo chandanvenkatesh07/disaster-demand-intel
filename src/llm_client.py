@@ -127,11 +127,11 @@ structured filter object. Output ONLY a JSON object using these optional keys
   min_older_housing_score               0..1 float
   max_older_housing_score               0..1 float
   min_dpi, max_dpi                      0..1 float
-  require_hazard                        one of: hurricane, flood, wildfire,
-                                        heat_wave, tornado, hail, winter_storm
+  require_hazard                        must be 'hurricane' (only category in
+                                        this hurricane-focused build)
   min_hazard_score                      0..1 float (paired with require_hazard)
   require_active_alert                  true | false
-  active_category                       same enum as require_hazard
+  active_category                       must be 'hurricane'
   region                                one of: coastal, inland, panhandle,
                                         north, central, south
   sort_by                               one of: dpi, population, store_count,
