@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import json
 import os
+from collections import defaultdict
 
 import httpx
 import pandas as pd
 import pydeck as pdk
 import streamlit as st
+from shapely.geometry import LineString, mapping
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
 
@@ -89,6 +91,31 @@ def fetch_whatif(fips: str, event: str, severity: str, category: str) -> dict:
     return r.json()
 
 
+@st.cache_data(ttl=300)
+def fetch_scenarios() -> list[dict]:
+    r = httpx.get(f"{BACKEND_URL}/scenarios", timeout=15)
+    r.raise_for_status()
+    return r.json()["scenarios"]
+
+
+def activate_scenario(scenario_id: str) -> dict:
+    r = httpx.post(f"{BACKEND_URL}/scenarios/{scenario_id}/activate", timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+
+def clear_scenario() -> dict:
+    r = httpx.post(f"{BACKEND_URL}/scenarios/clear", timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_scenario(scenario_id: str) -> dict:
+    r = httpx.get(f"{BACKEND_URL}/scenarios/{scenario_id}", timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
 def _dpi_color(dpi: float) -> list[int]:
     """0..1 DPI -> green->yellow->red RGBA."""
     dpi = max(0.0, min(1.0, dpi))
@@ -130,32 +157,75 @@ def _store_layer(stores: list[dict]) -> pdk.Layer:
     )
 
 
+def _scenario_layers(geom: dict) -> list[pdk.Layer]:
+    '''Build pydeck layers (cone polygons + storm-track lines) for an active scenario.
+
+    geom is the response from GET /scenarios/{id}: it has a 'paths' list, each entry
+    with 'waypoints' (list of [lon,lat]), 'hours_to_landfall', 'cone_buffer_deg'.
+    '''
+    path_rows = []
+    cone_rows = []
+    for p in geom.get('paths', []):
+        waypoints = [[w[0], w[1]] for w in p['waypoints']]
+        path_rows.append({'name': p['name'], 'path': waypoints})
+        line = LineString(p['waypoints'])
+        buf = line.buffer(p.get('cone_buffer_deg', 1.0))
+        # buf may be a Polygon; convert exterior to a list of [lon,lat] pairs.
+        if buf.is_empty:
+            continue
+        exterior = list(buf.exterior.coords)
+        cone_rows.append({'name': p['name'], 'polygon': [[c[0], c[1]] for c in exterior]})
+
+    layers = []
+    if cone_rows:
+        layers.append(pdk.Layer(
+            'PolygonLayer',
+            data=cone_rows,
+            get_polygon='polygon',
+            get_fill_color=[255, 200, 60, 60],
+            get_line_color=[210, 160, 30, 200],
+            line_width_min_pixels=1,
+            stroked=True,
+            filled=True,
+            pickable=True,
+        ))
+    if path_rows:
+        layers.append(pdk.Layer(
+            'PathLayer',
+            data=path_rows,
+            get_path='path',
+            get_color=[200, 30, 30, 220],
+            get_width=4,
+            width_min_pixels=2,
+            pickable=True,
+        ))
+    return layers
+
+
 # ---------------- Sidebar ----------------
 
 st.sidebar.title("Disaster Demand Map")
 st.sidebar.caption("Florida vertical slice. Local LLM only — no paid APIs.")
 
-st.sidebar.markdown("**Search counties** (natural language)")
-nl_query = st.sidebar.text_input(
-    "e.g. coastal counties with old housing and few stores",
-    placeholder="type a question...",
-    label_visibility="collapsed",
-)
-nl_submit = st.sidebar.button("Search", use_container_width=True)
-if nl_query and nl_submit:
-    with st.sidebar.status("Parsing query with local LLM..."):
-        try:
-            search_result = search_regions(nl_query)
-        except httpx.HTTPError as e:
-            st.sidebar.error(f"Search failed: {e}")
-            search_result = None
-    if search_result is not None:
-        st.session_state["search_result"] = search_result
+with st.sidebar.expander("Example scenarios", expanded=False):
+    scenarios = fetch_scenarios()
+    for s in scenarios:
+        if st.button(s["name"], key=f"scenario_{s['id']}"):
+            act_res = activate_scenario(s["id"])
+            geom_res = fetch_scenario(s["id"])
+            st.session_state["active_scenario"] = act_res
+            st.session_state["active_scenario_geom"] = geom_res
+            st.cache_data.clear()
+            st.rerun()
 
-if "search_result" in st.session_state and st.sidebar.button(
-    "Clear search", use_container_width=True
-):
-    del st.session_state["search_result"]
+if "active_scenario" in st.session_state:
+    st.sidebar.caption(f"Active: {st.session_state['active_scenario']['name']}")
+    if st.sidebar.button("Exit demo mode", use_container_width=True):
+        clear_scenario()
+        del st.session_state["active_scenario"]
+        del st.session_state["active_scenario_geom"]
+        st.cache_data.clear()
+        st.rerun()
 
 st.sidebar.markdown("---")
 
@@ -225,6 +295,13 @@ col_k2.metric("Home Depot stores", len(stores))
 col_k3.metric("Active NWS alerts (FL)", active_alert_total)
 col_k4.metric("Top DPI", f"{top_dpi:.3f}")
 
+if "active_scenario" in st.session_state:
+    st.warning(
+        "DEMO MODE — hypothetical scenario active: {}. Real NWS alerts are cleared.".format(
+            st.session_state["active_scenario"]["name"]
+        )
+    )
+
 with st.expander("Executive summary (local LLM, ~5-15s)", expanded=False):
     summary_limit = st.slider("Counties to summarise", 5, 20, 10,
                               key="exec_summary_limit")
@@ -262,6 +339,8 @@ with map_col:
         ),
         _store_layer(stores),
     ]
+    if 'active_scenario_geom' in st.session_state:
+        layers.extend(_scenario_layers(st.session_state['active_scenario_geom']))
     view = pdk.ViewState(latitude=28.0, longitude=-83.5, zoom=5.4, pitch=0)
     tooltip = {
         "html": (
@@ -304,6 +383,41 @@ with map_col:
         df["DPI"] = df["DPI"].map(lambda x: f"{x:.3f}")
         df["Pop"] = df["Pop"].map(lambda x: f"{x:,}")
         st.dataframe(df, hide_index=True, use_container_width=True)
+
+    if "active_scenario" in st.session_state:
+        st.markdown("---")
+        st.subheader("Store preparation plan")
+        prep_plan = st.session_state["active_scenario"]["prep_plan"]
+        buckets = ["T-0", "T-12h", "T-24h", "T-48h", "T-72h+"]
+        bucket_counts = defaultdict(int)
+        for entry in prep_plan:
+            bucket_counts[entry["time_bucket"]] += 1
+
+        summary_data = []
+        for b in buckets:
+            summary_data.append({"Time Bucket": b, "Stores": bucket_counts.get(b, 0)})
+        st.dataframe(pd.DataFrame(summary_data), hide_index=True, use_container_width=True)
+
+        checklist_items = prep_plan[0].get("stock_checklist", []) if prep_plan else []
+        if checklist_items:
+            st.info(f"Checklist: {', '.join(checklist_items)}")
+
+        for b in buckets:
+            bucket_entries = [e for e in prep_plan if e["time_bucket"] == b]
+            if bucket_entries:
+                st.markdown(f"**{b} — {len(bucket_entries)} stores**")
+                bucket_df = pd.DataFrame(bucket_entries)[
+                    ["county", "name", "path_name", "distance_km", "hours_to_impact"]
+                ].rename(
+                    columns={
+                        "county": "County",
+                        "name": "Store",
+                        "path_name": "Path",
+                        "distance_km": "Distance km",
+                        "hours_to_impact": "Hours-to-impact",
+                    }
+                )
+                st.dataframe(bucket_df, hide_index=True, use_container_width=True)
 
 with detail_col:
     st.subheader("County detail")

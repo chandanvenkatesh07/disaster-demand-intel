@@ -17,14 +17,20 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+import duckdb
+
 from .ingest.noaa_alerts import ingest as refresh_noaa_alerts
 from .llm_client import LLMClient
+from .scenarios.library import SCENARIOS
+from .scenarios.prep_plan import compute_prep_plan
+from .scenarios import Scenario
 from .scoring import (
     CountyScore,
     apply_filter,
@@ -130,7 +136,6 @@ def explain_region(fips: str) -> dict:
 
 @app.get("/stores")
 def list_stores() -> dict:
-    import duckdb
     con = duckdb.connect(DB_PATH.as_posix())
     rows = con.execute("""
         SELECT s.osm_id, s.lat, s.lon, s.name, sc.fips, sc.county_name
@@ -250,3 +255,129 @@ def whatif(fips: str, body: WhatIfBody) -> dict:
         "delta": delta,
         "explanation": explanation,
     }
+
+
+@app.get("/scenarios")
+def list_scenarios() -> dict:
+    scenarios_list = []
+    for s in SCENARIOS.values():
+        affected_fips = set()
+        for alert in s.synthetic_alerts:
+            affected_fips.update(alert.affected_fips)
+        scenarios_list.append({
+            "id": s.id,
+            "name": s.name,
+            "hurricane_name": s.hurricane_name,
+            "description": s.description,
+            "path_count": len(s.paths),
+            "affected_county_count": len(affected_fips),
+        })
+    return {"count": len(scenarios_list), "scenarios": scenarios_list}
+
+
+@app.get("/scenarios/{scenario_id}")
+def get_scenario(scenario_id: str) -> dict:
+    scenario = SCENARIOS.get(scenario_id)
+    if not scenario:
+        raise HTTPException(status_code=404, detail=f"Scenario {scenario_id} not found")
+    
+    affected_fips = set()
+    for alert in scenario.synthetic_alerts:
+        affected_fips.update(alert.affected_fips)
+        
+    paths_out = []
+    for p in scenario.paths:
+        paths_out.append({
+            "name": p.name,
+            "waypoints": [[wp[0], wp[1]] for wp in p.waypoints],
+            "hours_to_landfall": list(p.hours_to_landfall),
+            "cone_buffer_deg": p.cone_buffer_deg,
+        })
+        
+    alerts_out = []
+    for a in scenario.synthetic_alerts:
+        alerts_out.append({
+            "alert_id": a.alert_id,
+            "event": a.event,
+            "category": a.category,
+            "severity": a.severity,
+            "severity_score": a.severity_score,
+            "headline": a.headline,
+            "affected_fips": list(a.affected_fips),
+        })
+        
+    return {
+        "id": scenario.id,
+        "name": scenario.name,
+        "hurricane_name": scenario.hurricane_name,
+        "description": scenario.description,
+        "paths": paths_out,
+        "synthetic_alerts": alerts_out,
+        "affected_fips_union": sorted(affected_fips),
+    }
+
+
+@app.post("/scenarios/{scenario_id}/activate")
+def activate_scenario(scenario_id: str) -> dict:
+    scenario = SCENARIOS.get(scenario_id)
+    if not scenario:
+        raise HTTPException(status_code=404, detail=f"Scenario {scenario_id} not found")
+        
+    con = duckdb.connect(DB_PATH.as_posix())
+    try:
+        con.execute("DELETE FROM noaa_alert_county")
+        con.execute("DELETE FROM noaa_alert")
+        
+        now_iso = datetime.now(timezone.utc).isoformat()
+        alerts_injected = 0
+        
+        for alert in scenario.synthetic_alerts:
+            effective_iso = now_iso
+            expires_iso = now_iso
+            con.execute(
+                "INSERT INTO noaa_alert (alert_id, event, category, severity, severity_score, headline, area_desc, effective, expires, ingested_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (alert.alert_id, alert.event, alert.category, alert.severity, alert.severity_score, alert.headline, f"(scenario:{scenario_id})", effective_iso, expires_iso, now_iso)
+            )
+            for fips in alert.affected_fips:
+                con.execute(
+                    "INSERT INTO noaa_alert_county (alert_id, fips) VALUES (?, ?)",
+                    (alert.alert_id, fips)
+                )
+            alerts_injected += 1
+            
+        con.commit()
+        
+        stores = con.execute("""
+            SELECT s.osm_id, s.lat, s.lon, s.name, sc.fips, sc.county_name AS county 
+            FROM home_depot_store s 
+            LEFT JOIN store_county sc USING (osm_id)
+        """).fetchall()
+        
+        stores_dicts = [
+            {"osm_id": r[0], "lat": r[1], "lon": r[2], "name": r[3], "fips": r[4], "county": r[5]}
+            for r in stores
+        ]
+        
+        plan = compute_prep_plan(scenario, stores_dicts)
+        
+        return {
+            "scenario_id": scenario_id,
+            "name": scenario.name,
+            "alerts_injected": alerts_injected,
+            "stores_in_cone": len(plan),
+            "prep_plan": plan,
+        }
+    finally:
+        con.close()
+
+
+@app.post("/scenarios/clear")
+def clear_scenario_alerts() -> dict:
+    con = duckdb.connect(DB_PATH.as_posix())
+    try:
+        con.execute("DELETE FROM noaa_alert_county")
+        con.execute("DELETE FROM noaa_alert")
+        con.commit()
+    finally:
+        con.close()
+    return {"cleared": True, "note": "call POST /refresh/alerts to re-pull live NOAA data."}
