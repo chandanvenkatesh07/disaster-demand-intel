@@ -11,3 +11,7 @@ runtime/
 *.egg-info/
 .aider*
 scripts/_dev_proxy.py
+scripts/_perf_test.py
+scripts/_perf_test_agg.py
+runtime/perf_test.log
+runtime/perf_test_agg.log
