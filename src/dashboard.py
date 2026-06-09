@@ -228,7 +228,7 @@ def _scenario_layers(geom: dict) -> list[pdk.Layer]:
 st.sidebar.title("FL Hurricane Demand")
 st.sidebar.caption("Hurricane-only build. Local LLM only — no paid APIs.")
 
-with st.sidebar.expander("Example scenarios", expanded=False):
+with st.sidebar.expander("Simulations", expanded=False):
     scenarios = fetch_scenarios()
     for s in scenarios:
         if st.button(s["name"], key=f"scenario_{s['id']}"):

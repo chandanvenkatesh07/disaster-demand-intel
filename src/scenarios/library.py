@@ -1,4 +1,4 @@
-"""Hurricane scenarios used by the Example Scenarios feature.
+"""Hurricane scenarios used by the Simulations feature.
 
 All scenarios are hurricane-only. Each one has:
   - At least one storm path with waypoints + hours-to-landfall at each.

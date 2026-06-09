@@ -19,7 +19,7 @@ numbers, inventory, or forecasts.
   hurricane alerts, recommended stock categories.
 - "Generate explanation" button → 3-5 grounded bullets + a one-sentence stock
   summary from the local LLM. Cached on disk.
-- **Example Scenarios** (sidebar): four pre-built hurricane situations —
+- **Simulations** (sidebar): four pre-built hurricane situations —
   Charley 2004 (landfall now), Wilma 2005 (T-24h), two-path forecast cone
   (T-48h), and an Atlantic approach 5 days out. Each renders the storm track,
   cone of uncertainty, synthetic NWS alerts, and a per-store preparation plan
